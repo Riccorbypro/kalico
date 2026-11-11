@@ -180,19 +180,46 @@ class PrinterFan:
         self.fan = Fan(config)
         # Register commands
         gcode = config.get_printer().lookup_object("gcode")
+        self.gcode = gcode
+        self.p_selector_map = config.getlist(
+            "p_selector_map", default=None, sep=","
+        )
         gcode.register_command("M106", self.cmd_M106)
         gcode.register_command("M107", self.cmd_M107)
 
     def get_status(self, eventtime):
         return self.fan.get_status(eventtime)
 
+    def _resolve_p_target(self, gcmd):
+        # Preserve the fork's 1-based selection of fan_generic names.
+        try:
+            index = int(gcmd.get("P"))
+        except ValueError:
+            raise self.gcode.error("Fan P is not a valid index")
+        if index < 1 or index > len(self.p_selector_map):
+            raise self.gcode.error("Fan P index out of range")
+        return self.p_selector_map[index - 1]
+
     def cmd_M106(self, gcmd):
         # Set fan speed
         value = gcmd.get_float("S", 255.0, minval=0.0) / 255.0
+        if self.p_selector_map and gcmd.get("P", None) is not None:
+            target = self._resolve_p_target(gcmd)
+            self.gcode.run_script_from_command(
+                "SET_FAN_SPEED FAN=%s SPEED=%0.6f"
+                % (target, max(0.0, min(1.0, value)))
+            )
+            return
         self.fan.set_speed_from_command(value)
 
     def cmd_M107(self, gcmd):
         # Turn fan off
+        if self.p_selector_map and gcmd.get("P", None) is not None:
+            target = self._resolve_p_target(gcmd)
+            self.gcode.run_script_from_command(
+                "SET_FAN_SPEED FAN=%s SPEED=0" % (target,)
+            )
+            return
         self.fan.set_speed_from_command(0.0)
 
 
