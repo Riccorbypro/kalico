@@ -15,6 +15,7 @@
 // efficiency - the repetitive integer math is vastly faster in C.
 
 #include <math.h> // sqrt
+#include <pthread.h> // pthread_mutex_init
 #include <stddef.h> // offsetof
 #include <stdint.h> // uint32_t
 #include <stdio.h> // fprintf
@@ -44,6 +45,7 @@ struct stepcompress {
     uint64_t next_step_clock;
     int next_step_dir;
     // History tracking
+    pthread_mutex_t history_lock;
     int64_t last_position;
     struct list_head history_list;
 };
@@ -247,6 +249,7 @@ stepcompress_alloc(struct list_head *msg_queue)
 {
     struct stepcompress *sc = malloc(sizeof(*sc));
     memset(sc, 0, sizeof(*sc));
+    pthread_mutex_init(&sc->history_lock, NULL);
     list_init(&sc->history_list);
     sc->sdir = -1;
     sc->msg_queue = msg_queue;
@@ -280,6 +283,7 @@ stepcompress_set_invert_sdir(struct stepcompress *sc, uint32_t invert_sdir)
 void
 stepcompress_history_expire(struct stepcompress *sc, uint64_t end_clock)
 {
+    pthread_mutex_lock(&sc->history_lock);
     while (!list_empty(&sc->history_list)) {
         struct history_steps *hs = list_last_entry(
             &sc->history_list, struct history_steps, node);
@@ -288,6 +292,7 @@ stepcompress_history_expire(struct stepcompress *sc, uint64_t end_clock)
         list_del(&hs->node);
         free(hs);
     }
+    pthread_mutex_unlock(&sc->history_lock);
 }
 
 // Free memory associated with a 'stepcompress' object
@@ -298,6 +303,7 @@ stepcompress_free(struct stepcompress *sc)
         return;
     free(sc->queue);
     stepcompress_history_expire(sc, UINT64_MAX);
+    pthread_mutex_destroy(&sc->history_lock);
     free(sc);
 }
 
@@ -357,12 +363,15 @@ add_move(struct stepcompress *sc, uint64_t first_clock, struct step_move *move)
     struct history_steps *hs = malloc(sizeof(*hs));
     hs->first_clock = first_clock;
     hs->last_clock = last_clock;
-    hs->start_position = sc->last_position;
     hs->interval = move->interval;
     hs->add = move->add;
     hs->step_count = sc->sdir ? move->count : -move->count;
+
+    pthread_mutex_lock(&sc->history_lock);
+    hs->start_position = sc->last_position;
     sc->last_position += hs->step_count;
     list_add_head(&hs->node, &sc->history_list);
+    pthread_mutex_unlock(&sc->history_lock);
 }
 
 // Convert previously scheduled steps into commands for the mcu
@@ -563,14 +572,17 @@ stepcompress_set_last_position(struct stepcompress *sc, uint64_t clock
     int ret = stepcompress_flush(sc, UINT64_MAX);
     if (ret)
         return ret;
-    sc->last_position = last_position;
 
     // Add a marker to the history list
     struct history_steps *hs = malloc(sizeof(*hs));
     memset(hs, 0, sizeof(*hs));
     hs->first_clock = hs->last_clock = clock;
     hs->start_position = last_position;
+
+    pthread_mutex_lock(&sc->history_lock);
+    sc->last_position = last_position;
     list_add_head(&hs->node, &sc->history_list);
+    pthread_mutex_unlock(&sc->history_lock);
     return 0;
 }
 
@@ -578,29 +590,53 @@ stepcompress_set_last_position(struct stepcompress *sc, uint64_t clock
 int64_t __visible
 stepcompress_find_past_position(struct stepcompress *sc, uint64_t clock)
 {
+    pthread_mutex_lock(&sc->history_lock);
     int64_t last_position = sc->last_position;
     struct history_steps *hs;
+    int64_t result = last_position;
+    uint64_t first_clock = 0;
+    int64_t start_position = 0;
+    int32_t step_count = 0, interval = 0, add = 0;
+    int have_partial_move = 0;
+    int found_position = 0;
     list_for_each_entry(hs, &sc->history_list, node) {
         if (clock < hs->first_clock) {
             last_position = hs->start_position;
             continue;
         }
-        if (clock >= hs->last_clock)
-            return hs->start_position + hs->step_count;
-        int32_t interval = hs->interval, add = hs->add;
-        int32_t ticks = (int32_t)(clock - hs->first_clock) + interval, offset;
-        if (!add) {
-            offset = ticks / interval;
-        } else {
-            // Solve for "count" using quadratic formula
-            double a = .5 * add, b = interval - .5 * add, c = -ticks;
-            offset = (sqrt(b*b - 4*a*c) - b) / (2. * a);
+        if (clock >= hs->last_clock) {
+            result = hs->start_position + hs->step_count;
+            found_position = 1;
+            break;
         }
-        if (hs->step_count < 0)
-            return hs->start_position - offset;
-        return hs->start_position + offset;
+        first_clock = hs->first_clock;
+        start_position = hs->start_position;
+        step_count = hs->step_count;
+        interval = hs->interval;
+        add = hs->add;
+        have_partial_move = 1;
+        break;
     }
-    return last_position;
+    pthread_mutex_unlock(&sc->history_lock);
+
+    if (!have_partial_move) {
+        if (!found_position)
+            result = last_position;
+        return result;
+    }
+    int32_t ticks = (int32_t)(clock - first_clock) + interval, offset;
+    if (!add) {
+        offset = ticks / interval;
+    } else {
+        // Solve for "count" using quadratic formula
+        double a = .5 * add, b = interval - .5 * add, c = -ticks;
+        offset = (sqrt(b*b - 4*a*c) - b) / (2. * a);
+    }
+    if (step_count < 0)
+        result = start_position - offset;
+    else
+        result = start_position + offset;
+    return result;
 }
 
 // Return history of queue_step commands
@@ -608,6 +644,7 @@ int __visible
 stepcompress_extract_old(struct stepcompress *sc, struct pull_history_steps *p
                          , int max, uint64_t start_clock, uint64_t end_clock)
 {
+    pthread_mutex_lock(&sc->history_lock);
     int res = 0;
     struct history_steps *hs;
     list_for_each_entry(hs, &sc->history_list, node) {
@@ -624,5 +661,6 @@ stepcompress_extract_old(struct stepcompress *sc, struct pull_history_steps *p
         p++;
         res++;
     }
+    pthread_mutex_unlock(&sc->history_lock);
     return res;
 }
