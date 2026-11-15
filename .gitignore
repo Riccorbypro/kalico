@@ -23,3 +23,6 @@ site/
 env/
 venv/
 mkdocs-env/
+
+# Native helper build products
+klippy/chelper/*.o
